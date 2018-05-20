@@ -3,7 +3,10 @@ module Main where
 
 import Prelude hiding (readFile, log)
 import qualified Data.ByteString.Lazy as B
+import qualified Data.ByteString.Internal as BS
+import qualified Data.ByteArray as BA
 import Text.Printf
+import System.IO (withFile, IOMode(..), SeekMode(..), hSeek)
 
 import Data.Monoid
 import Control.Applicative
@@ -12,41 +15,46 @@ import Control.Monad.Reader
 
 import Data.Torrent
 import Data.Foldable (toList)
-import Crypto.Hash
+import qualified Crypto.Hash as CR
 import Data.String
 import qualified System.Directory as Dir
 import qualified System.Directory.Tree as Dir
 import qualified Data.Text.Encoding as Txt
 import qualified Data.Text as Txt
 import qualified Data.Map as M
+import Control.Monad.Logic
+import Control.Monad.Plus
+import Data.List (foldl1')
+
+import Data.Interval
+import qualified Data.IntervalMap.Lazy as IM
+
+intInt :: Integer -> Integer -> Interval Integer
+intInt a b = Finite a <=..< Finite b
 
 type Hook = String
 
 type MyMonad a = ReaderT Config IO a
 
-data Config = Config
-              { _copy           :: Bool
-              , _verbosity      :: Int
-              , _dryRun         :: Bool
-              , _torrentHook
-              , _fileHook       :: Hook
-              , _outDir
-              , _fileDir        :: FilePath
-              , _torrentFiles   :: [FilePath]
-              } deriving (Show)
+data Config =
+    Config
+    { _copy           :: Bool
+    , _verbosity      :: Int
+    , _dryRun         :: Bool
+    , _torrentHook
+    , _fileHook       :: Hook
+    , _outDir
+    , _fileDir        :: FilePath
+    , _torrentFiles   :: [FilePath]
+    } deriving (Show)
 
-data FromFile = FromFile
-                { _fromPath :: FilePath
-                , _fromSize :: Integer
-                } deriving (Show)
+data FromFile =
+    FromFile
+    { _fromPath :: FilePath
+    , _fromSize :: Integer
+    } deriving (Show)
 
-data ToFile = ToFile
-              { _torrentFile   :: FilePath
-              , _toPath        :: [B.ByteString]
-              , _toSize
-              , _offset
-              , _chunkSize     :: Integer
-              } deriving (Show)
+type ToFiles = IM.IntervalMap Integer (Interval Integer, FilePath)
 
 data Match = FilePath :-> FilePath
              deriving (Show)
@@ -54,27 +62,27 @@ data Match = FilePath :-> FilePath
 cliOptions :: Parser Config
 cliOptions = Config <$>
                switch (long "copy"
-                          <> short 'C'
-                          <> help "copy files instead of moving") <*>
+                    <> short 'C'
+                    <> help "copy files instead of moving") <*>
                option auto (long "verbose"
-                           <> short 'v') <*>
+                         <> short 'v') <*>
                switch (long "pretend"
-                          <> short 'p'
-                          <> help "dry run") <*>
+                    <> short 'p'
+                    <> help "dry run") <*>
                strOption (long "torrent-hook"
-                         <> value ""
-                         <> help "Execute shell command for each processed torrent") <*>
+                       <> value ""
+                       <> help "Execute shell command for each processed torrent") <*>
                strOption (long "file-hook"
-                         <> value ""
-                         <> help "Execute shell command for each processed file") <*>
+                       <> value ""
+                       <> help "Execute shell command for each processed file") <*>
                strOption (long "output-dir"
-                         <> short 'o'
-                         <> value "./photobt"
-                         <> help "Move output files there") <*>
+                       <> short 'o'
+                       <> value "./photobt"
+                       <> help "Move output files there") <*>
                strOption (long "files"
-                         <> short 'f'
-                         <> value "."
-                         <> metavar "files_directory") <*>
+                       <> short 'f'
+                       <> value "."
+                       <> metavar "files_directory") <*>
                many (strArgument $ metavar "torrent_file")
 
 loadTorrents :: MyMonad [(FilePath, Torrent)]
@@ -90,53 +98,24 @@ loadTorrents =
     paths <- asks _torrentFiles
     concat <$> mapM readTorrent' paths
 
-torrentFiles :: FilePath -> Torrent -> [ToFile]
-torrentFiles fileName Torrent{tInfo = torrent} =
-  let
-    pieceLen = tPieceLength torrent
-    dirName = case torrent of
-                SingleFile{} ->
-                  []
-                MultiFile{tName = n} ->
-                  [n]
+torrentFiles' :: TorrentInfo -> [TorrentFile]
+torrentFiles' SingleFile{tLength = l, tName = n} = [TorrentFile l [n]]
+torrentFiles' MultiFile{tFiles = ff} = ff
 
-    toFile (offset, acc) tFile = (offset + len, f : acc)
-        where f = ToFile { _torrentFile = fileName
-                         , _toPath      = dirName ++ filePath tFile
-                         , _toSize      = len
-                         , _offset      = offset
-                         , _chunkSize   = pieceLen
-                         }
-              len = fileLength tFile
+torrentFiles :: TorrentInfo -> ToFiles
+torrentFiles torrent =
+  let
+    toFile (offset, acc) tFile = ( offset + len
+                                 , IM.insert int (int, path) acc
+                                 )
+        where path = bslToFilePath $ filePath tFile
+              len = fileLength tFile              
+              int = offset `intInt` (offset + len)
   in
-  snd $ case torrent of
-          SingleFile{tLength = l, tName = n} ->
-            toFile (0, []) $ TorrentFile l [n]
-          MultiFile{tFiles = ff} ->
-            foldl toFile (0, []) ff
+    snd $ foldl toFile (0, IM.empty) $ torrentFiles' torrent
 
-mkChunkMap :: [(FilePath, Torrent)] -> M.Map FilePath B.ByteString
-mkChunkMap l = M.fromList [(k, tPieces $ tInfo v) | (k, v) <- l]
-
-mkSizeIndex :: [ToFile] -> M.Map Integer [ToFile]
-mkSizeIndex = foldl (\m v -> M.insertWith (++) (_toSize v) [v] m) M.empty
-
-verify :: M.Map FilePath B.ByteString -> FromFile
-       -> ToFile -> MyMonad [Match]
-verify chunks f ToFile{ _torrentFile = tf, _toPath = path
-                      , _offset = offset, _chunkSize = csz, _toSize = sz
-                      } =
-  let
-    torrent     = chunks M.! tf
-    offset'     = offset `rem` csz
-    trustworthy = sz - offset' > csz
-    fromPath    = _fromPath f
-    toPath      = bslToFilePath path
-  in if trustworthy
-     then return [fromPath :-> toPath]
-     else log 5 (printf "Quickcheck %s -> %s failed due to size: chunk=%d \
-\offset'=%d size=%d" fromPath toPath csz offset' sz) >>
-          return []
+mkSizeIndex :: [FromFile] -> M.Map Integer [FromFile]
+mkSizeIndex = foldl (\m v -> M.insertWith (++) (_fromSize v) [v] m) M.empty
 
 bslToFilePath = Txt.unpack . Txt.decodeUtf8 . B.toStrict . B.intercalate "/"
 
@@ -146,26 +125,101 @@ findFromFiles = do
   path <- asks _fileDir
   lift $ (toList . Dir.dirTree) <$> Dir.readDirectoryWith go path
 
+readInterval :: (MonadIO m)
+             => Interval Integer
+             -> FilePath
+             -> m B.ByteString
+readInterval int path =
+  liftIO $ withFile path ReadMode $ \h -> do
+    let Finite offset = lowerBound int
+    hSeek h AbsoluteSeek offset
+    B.hGet h $ fromIntegral $ width int
+
+sha1 :: B.ByteString -> B.ByteString
+sha1 msg = B.fromChunks [BA.convert $ ((CR.hashlazy msg) :: CR.Digest CR.SHA1)]
+
+assertEqual :: (Eq a, Show a)
+            => String
+            -> a
+            -> a
+            -> LogicT (ReaderT Config IO) ()
+assertEqual msg a b = if a == b
+                      then return ()
+                      else do
+                        lift $ log 5 (printf "Assert failed %s /= %s; %s" (show a) (show b) msg)
+                        mzero
+
+zeropad :: Integer -> [B.ByteString] -> B.ByteString
+zeropad n b =
+  let
+    b' = B.concat b
+    d  = (fromIntegral n) - (B.length b')
+  in if d <= 0
+     then b'
+     else B.append b' (B.replicate d 0)
+        
+
+matchFiles :: M.Map Integer [FromFile]
+           -> (FilePath, Torrent)
+           -> MyMonad [Match]
+matchFiles fromFiles (torrentPath, Torrent{tInfo = torrent}) =
+  let
+    -- progress i success = return ()
+    --     -- | (i*80) `rem` numPieces == 0 = liftIO $ putChar (if success then '.' else 'x')
+    --     -- | otherwise = return ()
+
+    hashes    = tPieces torrent
+    numPieces = (fromIntegral $ B.length hashes) `div` 20
+    pieceSize = tPieceLength torrent
+    toFiles   = torrentFiles torrent
+
+    hash i = B.take 20 $ B.drop (fromIntegral $ i * 20) hashes
+
+    sameSize int = mfromList =<< mfromMaybe (M.lookup (width int) fromFiles)
+
+    tryFiles candidates hash = do
+      fromFiles <- mapM (liftM _fromPath . sameSize . fst . snd) candidates
+      let atoms' = zip (map fst candidates) fromFiles
+      piece <- B.concat <$> mapM (uncurry readInterval) atoms'
+      assertEqual (printf "files=%s" (show candidates)) hash (sha1 piece)
+      let candidates' = [path | (int, (trueInt, path)) <- candidates
+                              , upperBound trueInt == upperBound int
+                              ]
+      return $ zipWith (:->) fromFiles candidates'
+
+    go i acc
+        | i == numPieces = return acc
+        | otherwise      =
+            let
+              offset = i * pieceSize
+              pieceEnd = offset + pieceSize
+              piece = IM.singleton (offset `intInt` pieceEnd)
+                                   (error "Should not happen")
+              files = IM.toList $ toFiles `IM.intersection` piece
+            in ifte (tryFiles files $ hash i)
+                    (\match -> go (i+1) $ match ++ acc)
+                    (go (i+1) acc)
+  in do
+    log 3 (printf "%s: pieceSize=%d numPieces=%d"
+                  torrentPath
+                  pieceSize
+                  numPieces)
+    log 8 (printf "%s files: %s"
+                  torrentPath
+                  (show toFiles))
+    observeT $ go 0 []
+                             
 main :: IO ()
 main = do
   config <- execParser $ info (helper <*> cliOptions) fullDesc
   (flip runReaderT) config $ do
-    torrents <- loadTorrents
-    let toFiles    = torrents >>= uncurry torrentFiles
-        chunks     = mkChunkMap torrents
-        sizeIndex  = mkSizeIndex toFiles
-    fromFiles <- findFromFiles
+    fromFiles <- findFromFiles    
     log 7 (printf "fromFiles: %s" $ show fromFiles)
-    log 7 (printf "sizeIndex: %s" $ show sizeIndex)
-    let candidates1 = [(f, t) | f@FromFile{_fromSize = s} <- fromFiles
-                              , t <- maybeToList $ s `M.lookup` sizeIndex
-                              ]
-    matches <- concat <$> mapM (uncurry (verify chunks)) candidates1
+    torrents <- loadTorrents
+    let sizeIndex  = mkSizeIndex fromFiles
+    matches <- concat <$> mapM (matchFiles sizeIndex) torrents
     log 1 (printf "Found %d matches" $ length matches)
     forM_ matches $ \(a :-> b) -> log 2 (printf "%s -> %s" a b)
-
-maybeToList (Just a) = a
-maybeToList Nothing  = []
 
 log :: Int -> String -> MyMonad ()
 log severity str = do
