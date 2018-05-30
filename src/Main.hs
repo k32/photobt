@@ -9,6 +9,7 @@ import Text.Printf
 import System.IO (withFile, IOMode(..), SeekMode(..), hSeek)
 
 import Data.Monoid
+import Data.SparseMaptrix
 import Control.Applicative
 import Options.Applicative
 import Control.Monad.Reader
@@ -68,7 +69,7 @@ cliOptions = Config <$>
                          <> short 'v') <*>
                switch (long "pretend"
                     <> short 'p'
-                    <> help "dry run") <*>
+                    <> help "dry run: don't move or copy any files") <*>
                strOption (long "torrent-hook"
                        <> value ""
                        <> help "Execute shell command for each processed torrent") <*>
@@ -158,16 +159,13 @@ zeropad n b =
      then b'
      else B.append b' (B.replicate d 0)
         
-
-matchFiles :: M.Map Integer [FromFile]
-           -> (FilePath, Torrent)
-           -> MyMonad [Match]
-matchFiles fromFiles (torrentPath, Torrent{tInfo = torrent}) =
+-- | Thorouthly check hashes of all pieces. The slowest
+-- algorithm
+preciseMatch :: M.Map Integer [FromFile]
+             -> (FilePath, Torrent)
+             -> MyMonad [Match]
+preciseMatch fromFiles (torrentPath, Torrent{tInfo = torrent}) =
   let
-    -- progress i success = return ()
-    --     -- | (i*80) `rem` numPieces == 0 = liftIO $ putChar (if success then '.' else 'x')
-    --     -- | otherwise = return ()
-
     hashes    = tPieces torrent
     numPieces = (fromIntegral $ B.length hashes) `div` 20
     pieceSize = tPieceLength torrent
@@ -194,7 +192,7 @@ matchFiles fromFiles (torrentPath, Torrent{tInfo = torrent}) =
               offset = i * pieceSize
               pieceEnd = offset + pieceSize
               piece = IM.singleton (offset `intInt` pieceEnd)
-                                   (error "Should not happen")
+                                   (error "Should not happen (famous last words)")
               files = IM.toList $ toFiles `IM.intersection` piece
             in ifte (tryFiles files $ hash i)
                     (\match -> go (i+1) $ match ++ acc)
@@ -217,7 +215,7 @@ main = do
     log 7 (printf "fromFiles: %s" $ show fromFiles)
     torrents <- loadTorrents
     let sizeIndex  = mkSizeIndex fromFiles
-    matches <- concat <$> mapM (matchFiles sizeIndex) torrents
+    matches <- concat <$> mapM (preciseMatch sizeIndex) torrents
     log 1 (printf "Found %d matches" $ length matches)
     forM_ matches $ \(a :-> b) -> log 2 (printf "%s -> %s" a b)
 

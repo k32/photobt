@@ -1,5 +1,5 @@
 * Use case
 My hard drive died, I managed to restore some files using photorec,
-but names are a mess. Some files were downloaded from bittorent, I
-want to find which ones.
+but file names are a mess. Some files were downloaded from bittorent,
+I want to find out which ones.
 
